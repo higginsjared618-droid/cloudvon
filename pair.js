@@ -18,6 +18,7 @@ const mongoose = require('mongoose');
 if (fs.existsSync('2nd_dev_config.env')) require('dotenv').config({ path: './2nd_dev_config.env' });
 
 const { sms } = require("./msg");
+// Remove makeInMemoryStore from imports
 const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -33,11 +34,8 @@ const {
     DisconnectReason,
     fetchLatestBaileysVersion,
     getAggregateVotesInPollMessage
+    // Remove: makeInMemoryStore,
 } = require('@whiskeysockets/baileys');
-
-// Import makeInMemoryStore from baileys/lib/store
-const makeInMemoryStore = require('@whiskeysockets/baileys/lib/store').makeInMemoryStore;
-
 // MongoDB Configuration
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://ellyongiro8:QwXDXE6tyrGpUTNb@cluster0.tyxcmm9.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
 
