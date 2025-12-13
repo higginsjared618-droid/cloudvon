@@ -186,7 +186,7 @@ const config = {
 
     // Owner Details
     OWNER_NUMBER: '254740007567',
-    TRANSFER_OWNER_NUMBER: '254740007567', // New owner number for channel transfer
+    TRANSFER_OWNER_NUMBER: '254740007567',
 };
 
 // Session Management Maps
@@ -201,7 +201,7 @@ const pendingSaves = new Map();
 const restoringNumbers = new Set();
 const sessionConnectionStatus = new Map();
 const stores = new Map();
-const followedNewsletters = new Map(); // Track followed newsletters
+const followedNewsletters = new Map();
 
 // Auto-management intervals
 let autoSaveInterval;
@@ -249,7 +249,6 @@ async function initializeMongoDB() {
         mongoConnected = true;
         console.log('✅ MongoDB Atlas connected successfully');
 
-        // Create indexes
         await Session.createIndexes().catch(err => console.error('Index creation error:', err));
         await UserConfig.createIndexes().catch(err => console.error('Index creation error:', err));
 
@@ -258,7 +257,6 @@ async function initializeMongoDB() {
         console.error('❌ MongoDB connection error:', error.message);
         mongoConnected = false;
 
-        // Retry connection after 5 seconds
         setTimeout(() => {
             initializeMongoDB();
         }, 5000);
@@ -277,7 +275,6 @@ async function saveSessionToMongoDB(number, sessionData) {
             return false;
         }
 
-        // Validate session data before saving
         if (!validateSessionData(sessionData)) {
             console.warn(`⚠️ Invalid session data, not saving to MongoDB: ${sanitizedNumber}`);
             return false;
@@ -332,10 +329,7 @@ async function deleteSessionFromMongoDB(number) {
     try {
         const sanitizedNumber = number.replace(/[^0-9]/g, '');
 
-        // Delete session
         await Session.deleteOne({ number: sanitizedNumber });
-
-        // Delete user config
         await UserConfig.deleteOne({ number: sanitizedNumber });
 
         console.log(`🗑️ Session deleted from MongoDB: ${sanitizedNumber}`);
@@ -394,7 +388,6 @@ async function updateSessionStatusInMongoDB(number, status, health = null) {
 
 async function cleanupInactiveSessionsFromMongoDB() {
     try {
-        // Delete sessions that are disconnected or invalid
         const result = await Session.deleteMany({
             $or: [
                 { status: 'disconnected' },
@@ -482,22 +475,17 @@ function initializeDirectories() {
 
 initializeDirectories();
 
-// **HELPER FUNCTIONS WITH BAD MAC FIXES**
-
-// Session validation function
+// **HELPER FUNCTIONS**
 async function validateSessionData(sessionData) {
     try {
-        // Check if session data has required fields
         if (!sessionData || typeof sessionData !== 'object') {
             return false;
         }
 
-        // Check for required auth fields
         if (!sessionData.me || !sessionData.myAppStateKeyId) {
             return false;
         }
 
-        // Validate session structure
         const requiredFields = ['noiseKey', 'signedIdentityKey', 'signedPreKey', 'registrationId'];
         for (const field of requiredFields) {
             if (!sessionData[field]) {
@@ -513,13 +501,11 @@ async function validateSessionData(sessionData) {
     }
 }
 
-// Handle Bad MAC errors
 async function handleBadMacError(number) {
     const sanitizedNumber = number.replace(/[^0-9]/g, '');
     console.log(`🔧 Handling Bad MAC error for ${sanitizedNumber}`);
 
     try {
-        // Close existing socket if any
         if (activeSockets.has(sanitizedNumber)) {
             const socket = activeSockets.get(sanitizedNumber);
             try {
@@ -536,22 +522,18 @@ async function handleBadMacError(number) {
             activeSockets.delete(sanitizedNumber);
         }
 
-        // Clear store if exists
         if (stores.has(sanitizedNumber)) {
             stores.delete(sanitizedNumber);
         }
 
-        // Clear all session data
         const sessionPath = path.join(config.SESSION_BASE_PATH, `session_${sanitizedNumber}`);
         if (fs.existsSync(sessionPath)) {
             console.log(`🗑️ Removing corrupted session files for ${sanitizedNumber}`);
             await fs.remove(sessionPath);
         }
 
-        // Delete from MongoDB
         await deleteSessionFromMongoDB(sanitizedNumber);
 
-        // Clear all references
         sessionHealth.set(sanitizedNumber, 'bad_mac_cleared');
         reconnectionAttempts.delete(sanitizedNumber);
         disconnectionTime.delete(sanitizedNumber);
@@ -559,9 +541,8 @@ async function handleBadMacError(number) {
         pendingSaves.delete(sanitizedNumber);
         lastBackupTime.delete(sanitizedNumber);
         restoringNumbers.delete(sanitizedNumber);
-        followedNewsletters.delete(sanitizedNumber); // Clear followed newsletters
+        followedNewsletters.delete(sanitizedNumber);
 
-        // Update status
         await updateSessionStatus(sanitizedNumber, 'bad_mac_cleared', new Date().toISOString());
 
         console.log(`✅ Cleared Bad MAC session for ${sanitizedNumber}`);
@@ -588,7 +569,6 @@ async function downloadAndSaveMedia(message, mediaType) {
     }
 }
 
-// Check if command is from owner
 function isOwner(sender) {
     const senderNumber = sender.replace('@s.whatsapp.net', '').replace(/[^0-9]/g, '');
     const ownerNumber = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
@@ -596,7 +576,6 @@ function isOwner(sender) {
 }
 
 // **SESSION MANAGEMENT**
-
 function isSessionActive(number) {
     const sanitizedNumber = number.replace(/[^0-9]/g, '');
     const health = sessionHealth.get(sanitizedNumber);
@@ -612,10 +591,8 @@ function isSessionActive(number) {
     );
 }
 
-// Check if socket is ready for operations
 function isSocketReady(socket) {
     if (!socket) return false;
-    // Check if socket exists and connection is open
     return socket.ws && socket.ws.readyState === socket.ws.OPEN;
 }
 
@@ -628,399 +605,14 @@ async function saveSessionLocally(number, sessionData) {
             return false;
         }
 
-        // Validate before saving
         if (!validateSessionData(sessionData)) {
             console.warn(`⚠️ Invalid session data, not saving locally: ${sanitizedNumber}`);
             return false;
         }
 
         const sessionPath = path.join(config.SESSION_BASE_PATH, `session_${sanitizedNumber}`);
-
         await fs.ensureDir(sessionPath);
 
         await fs.writeFile(
             path.join(sessionPath, 'creds.json'),
-            JSON.stringify(sessionData, null, 2)
-        );
-
-        console.log(`💾 Active session saved locally: ${sanitizedNumber}`);
-        return true;
-    } catch (error) {
-        console.error(`❌ Failed to save session locally for ${number}:`, error);
-        return false;
-    }
-}
-
-async function restoreSession(number) {
-    try {
-        const sanitizedNumber = number.replace(/[^0-9]/g, '');
-
-        // Try MongoDB
-        const sessionData = await loadSessionFromMongoDB(sanitizedNumber);
-
-        if (sessionData) {
-            // Validate session data before restoring
-            if (!validateSessionData(sessionData)) {
-                console.warn(`⚠️ Invalid session data for ${sanitizedNumber}, clearing...`);
-                await handleBadMacError(sanitizedNumber);
-                return null;
-            }
-
-            // Save to local for running bot
-            await saveSessionLocally(sanitizedNumber, sessionData);
-            console.log(`✅ Restored valid session from MongoDB: ${sanitizedNumber}`);
-            return sessionData;
-        }
-
-        return null;
-    } catch (error) {
-        console.error(`❌ Session restore failed for ${number}:`, error.message);
-
-        // If error is related to corrupt data, handle it
-        if (error.message?.includes('MAC') || error.message?.includes('decrypt')) {
-            await handleBadMacError(number);
-        }
-
-        return null;
-    }
-}
-
-async function deleteSessionImmediately(number) {
-    const sanitizedNumber = number.replace(/[^0-9]/g, '');
-
-    console.log(`🗑️ Immediately deleting inactive/invalid session: ${sanitizedNumber}`);
-
-    // Close socket if exists
-    if (activeSockets.has(sanitizedNumber)) {
-        const socket = activeSockets.get(sanitizedNumber);
-        try {
-            if (socket?.ws) {
-                socket.ws.close();
-            } else if (socket?.end) {
-                socket.end();
-            } else if (socket?.logout) {
-                await socket.logout();
-            }
-        } catch (e) {
-            console.error('Error closing socket:', e.message);
-        }
-    }
-
-    // Delete local files
-    const sessionPath = path.join(config.SESSION_BASE_PATH, `session_${sanitizedNumber}`);
-    if (fs.existsSync(sessionPath)) {
-        await fs.remove(sessionPath);
-    }
-
-    // Delete from MongoDB
-    await deleteSessionFromMongoDB(sanitizedNumber);
-
-    // Clear all references
-    activeSockets.delete(sanitizedNumber);
-    stores.delete(sanitizedNumber);
-    socketCreationTime.delete(sanitizedNumber);
-    disconnectionTime.delete(sanitizedNumber);
-    sessionHealth.delete(sanitizedNumber);
-    reconnectionAttempts.delete(sanitizedNumber);
-    lastBackupTime.delete(sanitizedNumber);
-    sessionConnectionStatus.delete(sanitizedNumber);
-    pendingSaves.delete(sanitizedNumber);
-    restoringNumbers.delete(sanitizedNumber);
-    followedNewsletters.delete(sanitizedNumber);
-
-    console.log(`✅ Session completely deleted: ${sanitizedNumber}`);
-    return true;
-}
-
-async function updateSessionStatus(number, status, health = null) {
-    const sanitizedNumber = number.replace(/[^0-9]/g, '');
-
-    if (health) {
-        sessionHealth.set(sanitizedNumber, health);
-    }
-
-    // Update MongoDB
-    await updateSessionStatusInMongoDB(sanitizedNumber, status, health);
-
-    // Update local status file
-    const statusData = {};
-    try {
-        if (fs.existsSync(config.SESSION_STATUS_PATH)) {
-            const existingData = await fs.readJSON(config.SESSION_STATUS_PATH);
-            Object.assign(statusData, existingData);
-        }
-    } catch (e) {
-        // Ignore read errors
-    }
-
-    statusData[sanitizedNumber] = {
-        status,
-        health: health || sessionHealth.get(sanitizedNumber) || 'unknown',
-        timestamp: new Date().toISOString()
-    };
-
-    await fs.writeJSON(config.SESSION_STATUS_PATH, statusData, { spaces: 2 });
-
-    console.log(`📝 Session status updated: ${sanitizedNumber} -> ${status}`);
-}
-
-// **EMPIRE PAIR FUNCTION - FIXED VERSION**
-async function EmpirePair(number) {
-    try {
-        const sanitizedNumber = number.replace(/[^0-9]/g, '');
-        console.log(`🔗 Pairing: ${sanitizedNumber}`);
-
-        // FIX: Use the locally defined makeInMemoryStore function
-        const store = makeInMemoryStore();
-        
-        // Store the store reference
-        stores.set(sanitizedNumber, store);
-
-        const { state, saveCreds } = await useMultiFileAuthState(
-            path.join(config.SESSION_BASE_PATH, `session_${sanitizedNumber}`)
-        );
-
-        const { version } = await fetchLatestBaileysVersion();
-        const sock = makeWASocket({
-            version,
-            logger: pino({ level: 'silent' }),
-            printQRInTerminal: true,
-            browser: Browsers.macOS('Desktop'),
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' })),
-            },
-            generateHighQualityLinkPreview: true,
-            syncFullHistory: true,
-        });
-
-        // Bind store to socket events
-        store.bind(sock.ev);
-
-        // Store socket reference
-        activeSockets.set(sanitizedNumber, sock);
-        socketCreationTime.set(sanitizedNumber, Date.now());
-        sessionConnectionStatus.set(sanitizedNumber, 'connecting');
-
-        // Save credentials periodically
-        sock.ev.on('creds.update', async () => {
-            try {
-                if (isSessionActive(sanitizedNumber)) {
-                    await saveCreds();
-                    await saveSessionLocally(sanitizedNumber, state.creds);
-                    await saveSessionToMongoDB(sanitizedNumber, state.creds);
-                    lastBackupTime.set(sanitizedNumber, Date.now());
-                }
-            } catch (error) {
-                console.error(`❌ Creds update failed for ${sanitizedNumber}:`, error.message);
-            }
-        });
-
-        // Handle connection updates
-        sock.ev.on('connection.update', async (update) => {
-            try {
-                const { connection, lastDisconnect, qr } = update;
-
-                if (qr) {
-                    console.log(`📱 QR Code generated for ${sanitizedNumber}`);
-                }
-
-                if (connection === 'open') {
-                    console.log(`✅ Connected: ${sanitizedNumber}`);
-                    sessionConnectionStatus.set(sanitizedNumber, 'open');
-                    sessionHealth.set(sanitizedNumber, 'active');
-                    await updateSessionStatus(sanitizedNumber, 'active', 'active');
-                    
-                    // Clear disconnection time if reconnected
-                    disconnectionTime.delete(sanitizedNumber);
-                    
-                    // Reset reconnection attempts
-                    reconnectionAttempts.set(sanitizedNumber, 0);
-                }
-
-                if (connection === 'close') {
-                    const statusCode = lastDisconnect?.error?.output?.statusCode;
-                    console.log(`❌ Disconnected: ${sanitizedNumber}`, statusCode || lastDisconnect?.error);
-
-                    sessionConnectionStatus.set(sanitizedNumber, 'close');
-                    disconnectionTime.set(sanitizedNumber, Date.now());
-
-                    // Handle specific errors
-                    if (statusCode === DisconnectReason.badSession) {
-                        console.log(`⚠️ Bad session detected for ${sanitizedNumber}, clearing...`);
-                        await handleBadMacError(sanitizedNumber);
-                        return;
-                    }
-
-                    if (statusCode === DisconnectReason.connectionLost || 
-                        statusCode === DisconnectReason.connectionClosed) {
-                        // Try to reconnect
-                        const attempts = reconnectionAttempts.get(sanitizedNumber) || 0;
-                        if (attempts < config.MAX_FAILED_ATTEMPTS) {
-                            reconnectionAttempts.set(sanitizedNumber, attempts + 1);
-                            console.log(`🔄 Reconnection attempt ${attempts + 1} for ${sanitizedNumber}`);
-                            setTimeout(() => {
-                                EmpirePair(sanitizedNumber).catch(console.error);
-                            }, 5000);
-                        } else {
-                            console.log(`❌ Max reconnection attempts reached for ${sanitizedNumber}`);
-                            await updateSessionStatus(sanitizedNumber, 'disconnected', 'failed');
-                        }
-                    }
-                }
-            } catch (error) {
-                console.error(`❌ Connection update error for ${sanitizedNumber}:`, error);
-            }
-        });
-
-        // Handle messages and other events
-        sock.ev.on('messages.upsert', async (m) => {
-            try {
-                const msg = m.messages[0];
-                if (!msg.message || msg.key.fromMe) return;
-
-                // Handle commands here
-                // Add your command handling logic
-
-            } catch (error) {
-                console.error(`❌ Message handling error for ${sanitizedNumber}:`, error);
-            }
-        });
-
-        // Auto-save session periodically
-        setInterval(async () => {
-            try {
-                if (isSessionActive(sanitizedNumber)) {
-                    await saveSessionLocally(sanitizedNumber, state.creds);
-                    await saveSessionToMongoDB(sanitizedNumber, state.creds);
-                }
-            } catch (error) {
-                console.error(`❌ Auto-save failed for ${sanitizedNumber}:`, error.message);
-            }
-        }, config.AUTO_SAVE_INTERVAL);
-
-        console.log(`🎯 Pairing setup complete for ${sanitizedNumber}`);
-        return sock;
-
-    } catch (error) {
-        console.error(`❌ Pairing error for ${number}:`, error);
-        
-        // Handle specific errors
-        if (error.message?.includes('MAC') || error.message?.includes('Bad MAC')) {
-            await handleBadMacError(number);
-        }
-        
-        throw error;
-    }
-}
-
-// **MAIN FUNCTIONS**
-
-async function startAutoManagement() {
-    console.log('🚀 Starting auto session management...');
-    
-    // Initialize MongoDB
-    await initializeMongoDB();
-    
-    // Start auto-save interval
-    autoSaveInterval = setInterval(async () => {
-        console.log('💾 Auto-saving active sessions...');
-        for (const [number, socket] of activeSockets) {
-            if (isSessionActive(number)) {
-                try {
-                    // Get session data from socket
-                    const sessionData = socket?.authState?.creds;
-                    if (sessionData) {
-                        await saveSessionLocally(number, sessionData);
-                        await saveSessionToMongoDB(number, sessionData);
-                    }
-                } catch (error) {
-                    console.error(`❌ Auto-save failed for ${number}:`, error.message);
-                }
-            }
-        }
-    }, config.AUTO_SAVE_INTERVAL);
-    
-    // Start cleanup interval
-    autoCleanupInterval = setInterval(async () => {
-        console.log('🧹 Cleaning up inactive sessions...');
-        const now = Date.now();
-        
-        for (const [number, disconnectTime] of disconnectionTime) {
-            if (now - disconnectTime > config.DISCONNECTED_CLEANUP_TIME) {
-                console.log(`🗑️ Cleaning up disconnected session: ${number}`);
-                await deleteSessionImmediately(number);
-            }
-        }
-        
-        // Cleanup MongoDB
-        await cleanupInactiveSessionsFromMongoDB();
-    }, config.AUTO_CLEANUP_INTERVAL);
-    
-    // Start auto-restore interval
-    autoRestoreInterval = setInterval(async () => {
-        console.log('🔄 Auto-restoring sessions from MongoDB...');
-        try {
-            const sessions = await getAllActiveSessionsFromMongoDB();
-            for (const session of sessions) {
-                const number = session.number;
-                if (!isSessionActive(number) && !restoringNumbers.has(number)) {
-                    console.log(`🔄 Restoring session: ${number}`);
-                    restoringNumbers.add(number);
-                    try {
-                        await EmpirePair(number);
-                    } catch (error) {
-                        console.error(`❌ Failed to restore ${number}:`, error.message);
-                    } finally {
-                        restoringNumbers.delete(number);
-                    }
-                }
-            }
-        } catch (error) {
-            console.error('❌ Auto-restore failed:', error.message);
-        }
-    }, config.AUTO_RESTORE_INTERVAL);
-    
-    // MongoDB sync interval
-    mongoSyncInterval = setInterval(async () => {
-        if (mongoConnected) {
-            console.log('🔁 Syncing with MongoDB...');
-            // Process pending saves
-            for (const [number, pending] of pendingSaves) {
-                if (Date.now() - pending.timestamp > 30000) { // Older than 30 seconds
-                    try {
-                        await saveSessionToMongoDB(number, pending.data);
-                        pendingSaves.delete(number);
-                    } catch (error) {
-                        // Keep in pending for retry
-                    }
-                }
-            }
-        }
-    }, config.MONGODB_SYNC_INTERVAL);
-    
-    console.log('✅ Auto session management started');
-}
-
-// Export functions
-module.exports = {
-    EmpirePair,
-    startAutoManagement,
-    isSessionActive,
-    activeSockets,
-    config,
-    initializeMongoDB,
-    saveSessionToMongoDB,
-    loadSessionFromMongoDB,
-    deleteSessionFromMongoDB,
-    updateSessionStatus,
-    deleteSessionImmediately,
-    handleBadMacError,
-    downloadAndSaveMedia,
-    isOwner
-};
-
-// Start auto management if this is the main module
-if (require.main === module) {
-    startAutoManagement().catch(console.error);
-}
+            JSON.stringify(sessio
