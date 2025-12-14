@@ -615,4 +615,877 @@ async function saveSessionLocally(number, sessionData) {
 
         await fs.writeFile(
             path.join(sessionPath, 'creds.json'),
-            JSON.stringify(sessio
+            JSON.stringify(sessionData, null, 2)
+        );
+
+        console.log(`💾 Active session saved locally: ${sanitizedNumber}`);
+        return true;
+    } catch (error) {
+        console.error(`❌ Failed to save session locally for ${number}:`, error);
+        return false;
+    }
+}
+
+async function restoreSession(number) {
+    try {
+        const sanitizedNumber = number.replace(/[^0-9]/g, '');
+
+        const sessionData = await loadSessionFromMongoDB(sanitizedNumber);
+
+        if (sessionData) {
+            if (!validateSessionData(sessionData)) {
+                console.warn(`⚠️ Invalid session data for ${sanitizedNumber}, clearing...`);
+                await handleBadMacError(sanitizedNumber);
+                return null;
+            }
+
+            await saveSessionLocally(sanitizedNumber, sessionData);
+            console.log(`✅ Restored valid session from MongoDB: ${sanitizedNumber}`);
+            return sessionData;
+        }
+
+        return null;
+    } catch (error) {
+        console.error(`❌ Session restore failed for ${number}:`, error.message);
+
+        if (error.message?.includes('MAC') || error.message?.includes('decrypt')) {
+            await handleBadMacError(number);
+        }
+
+        return null;
+    }
+}
+
+async function deleteSessionImmediately(number) {
+    const sanitizedNumber = number.replace(/[^0-9]/g, '');
+    console.log(`🗑️ Immediately deleting inactive/invalid session: ${sanitizedNumber}`);
+
+    if (activeSockets.has(sanitizedNumber)) {
+        const socket = activeSockets.get(sanitizedNumber);
+        try {
+            if (socket?.ws) {
+                socket.ws.close();
+            } else if (socket?.end) {
+                socket.end();
+            } else if (socket?.logout) {
+                await socket.logout();
+            }
+        } catch (e) {
+            console.error('Error closing socket:', e.message);
+        }
+    }
+
+    const sessionPath = path.join(config.SESSION_BASE_PATH, `session_${sanitizedNumber}`);
+    if (fs.existsSync(sessionPath)) {
+        await fs.remove(sessionPath);
+    }
+
+    await deleteSessionFromMongoDB(sanitizedNumber);
+
+    activeSockets.delete(sanitizedNumber);
+    stores.delete(sanitizedNumber);
+    socketCreationTime.delete(sanitizedNumber);
+    disconnectionTime.delete(sanitizedNumber);
+    sessionHealth.delete(sanitizedNumber);
+    reconnectionAttempts.delete(sanitizedNumber);
+    lastBackupTime.delete(sanitizedNumber);
+    sessionConnectionStatus.delete(sanitizedNumber);
+    pendingSaves.delete(sanitizedNumber);
+    restoringNumbers.delete(sanitizedNumber);
+    followedNewsletters.delete(sanitizedNumber);
+
+    console.log(`✅ Session completely deleted: ${sanitizedNumber}`);
+    return true;
+}
+
+async function updateSessionStatus(number, status, health = null) {
+    const sanitizedNumber = number.replace(/[^0-9]/g, '');
+
+    if (health) {
+        sessionHealth.set(sanitizedNumber, health);
+    }
+
+    await updateSessionStatusInMongoDB(sanitizedNumber, status, health);
+
+    const statusData = {};
+    try {
+        if (fs.existsSync(config.SESSION_STATUS_PATH)) {
+            const existingData = await fs.readJSON(config.SESSION_STATUS_PATH);
+            Object.assign(statusData, existingData);
+        }
+    } catch (e) {}
+
+    statusData[sanitizedNumber] = {
+        status,
+        health: health || sessionHealth.get(sanitizedNumber) || 'unknown',
+        timestamp: new Date().toISOString()
+    };
+
+    await fs.writeJSON(config.SESSION_STATUS_PATH, statusData, { spaces: 2 });
+    console.log(`📝 Session status updated: ${sanitizedNumber} -> ${status}`);
+}
+
+// **COMPLETE EMPIRE PAIR FUNCTION WITH ALL COMMANDS**
+async function EmpirePair(number) {
+    try {
+        const sanitizedNumber = number.replace(/[^0-9]/g, '');
+        console.log(`🔗 Pairing: ${sanitizedNumber}`);
+
+        const store = makeInMemoryStore();
+        stores.set(sanitizedNumber, store);
+
+        const { state, saveCreds } = await useMultiFileAuthState(
+            path.join(config.SESSION_BASE_PATH, `session_${sanitizedNumber}`)
+        );
+
+        const { version } = await fetchLatestBaileysVersion();
+        const sock = makeWASocket({
+            version,
+            logger: pino({ level: 'silent' }),
+            printQRInTerminal: true,
+            browser: Browsers.macOS('Desktop'),
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' })),
+            },
+            generateHighQualityLinkPreview: true,
+            syncFullHistory: true,
+        });
+
+        store.bind(sock.ev);
+        activeSockets.set(sanitizedNumber, sock);
+        socketCreationTime.set(sanitizedNumber, Date.now());
+        sessionConnectionStatus.set(sanitizedNumber, 'connecting');
+
+        // Save credentials periodically
+        sock.ev.on('creds.update', async () => {
+            try {
+                if (isSessionActive(sanitizedNumber)) {
+                    await saveCreds();
+                    await saveSessionLocally(sanitizedNumber, state.creds);
+                    await saveSessionToMongoDB(sanitizedNumber, state.creds);
+                    lastBackupTime.set(sanitizedNumber, Date.now());
+                }
+            } catch (error) {
+                console.error(`❌ Creds update failed for ${sanitizedNumber}:`, error.message);
+            }
+        });
+
+        // Handle connection updates
+        sock.ev.on('connection.update', async (update) => {
+            try {
+                const { connection, lastDisconnect, qr } = update;
+
+                if (qr) {
+                    console.log(`📱 QR Code generated for ${sanitizedNumber}`);
+                }
+
+                if (connection === 'open') {
+                    console.log(`✅ Connected: ${sanitizedNumber}`);
+                    sessionConnectionStatus.set(sanitizedNumber, 'open');
+                    sessionHealth.set(sanitizedNumber, 'active');
+                    await updateSessionStatus(sanitizedNumber, 'active', 'active');
+                    
+                    disconnectionTime.delete(sanitizedNumber);
+                    reconnectionAttempts.set(sanitizedNumber, 0);
+                    
+                    // Send welcome message
+                    const welcomeMessage = `✅ *BOT CONNECTED*\n\n📱 *Number:* ${sanitizedNumber}\n⏰ *Time:* ${moment().tz('Africa/Nairobi').format('YYYY-MM-DD HH:mm:ss')}\n🔧 *Status:* Active\n\n*Use commands with prefix:* ${config.PREFIX}`;
+                    await sock.sendMessage(sock.user.id, { text: welcomeMessage });
+                }
+
+                if (connection === 'close') {
+                    const statusCode = lastDisconnect?.error?.output?.statusCode;
+                    console.log(`❌ Disconnected: ${sanitizedNumber}`, statusCode || lastDisconnect?.error);
+
+                    sessionConnectionStatus.set(sanitizedNumber, 'close');
+                    disconnectionTime.set(sanitizedNumber, Date.now());
+
+                    if (statusCode === DisconnectReason.badSession) {
+                        console.log(`⚠️ Bad session detected for ${sanitizedNumber}, clearing...`);
+                        await handleBadMacError(sanitizedNumber);
+                        return;
+                    }
+
+                    if (statusCode === DisconnectReason.connectionLost || 
+                        statusCode === DisconnectReason.connectionClosed) {
+                        const attempts = reconnectionAttempts.get(sanitizedNumber) || 0;
+                        if (attempts < config.MAX_FAILED_ATTEMPTS) {
+                            reconnectionAttempts.set(sanitizedNumber, attempts + 1);
+                            console.log(`🔄 Reconnection attempt ${attempts + 1} for ${sanitizedNumber}`);
+                            setTimeout(() => {
+                                EmpirePair(sanitizedNumber).catch(console.error);
+                            }, 5000);
+                        } else {
+                            console.log(`❌ Max reconnection attempts reached for ${sanitizedNumber}`);
+                            await updateSessionStatus(sanitizedNumber, 'disconnected', 'failed');
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error(`❌ Connection update error for ${sanitizedNumber}:`, error);
+            }
+        });
+
+        // **BOT COMMANDS HANDLER**
+        sock.ev.on('messages.upsert', async (m) => {
+            try {
+                const msg = m.messages[0];
+                if (!msg.message || msg.key.fromMe) return;
+
+                const sender = msg.key.remoteJid;
+                const messageText = msg.message.conversation || 
+                                   msg.message.extendedTextMessage?.text || 
+                                   msg.message.imageMessage?.caption || '';
+                
+                const isGroup = sender.endsWith('@g.us');
+                const isOwnerMsg = isOwner(sender);
+
+                // Check if message starts with prefix
+                if (messageText.startsWith(config.PREFIX)) {
+                    const command = messageText.slice(config.PREFIX.length).trim().split(' ')[0].toLowerCase();
+                    const args = messageText.slice(config.PREFIX.length + command.length).trim();
+                    
+                    console.log(`📨 Command from ${sender}: ${command} ${args}`);
+
+                    // **HELP COMMAND**
+                    if (command === 'help' || command === 'menu') {
+                        const helpMenu = `╭─━━━━━━━━━━━━━━━━━━━─╮
+│   *BOT COMMANDS MENU*   │
+╰─━━━━━━━━━━━━━━━━━━━─╯
+
+╭─━━━━━━━━━━━━━━━━━━━─╮
+│ *📱 BASIC COMMANDS*      │
+├─────────────────────┤
+│ ${config.PREFIX}help - Show this menu
+│ ${config.PREFIX}ping - Check bot speed
+│ ${config.PREFIX}owner - Contact owner
+│ ${config.PREFIX}status - Bot status
+╰─━━━━━━━━━━━━━━━━━━━─╯
+
+╭─━━━━━━━━━━━━━━━━━━━─╮
+│ *🔧 SESSION COMMANDS*   │
+├─────────────────────┤
+│ ${config.PREFIX}pair - Pair new session
+│ ${config.PREFIX}list - List active sessions
+│ ${config.PREFIX}restart - Restart session
+│ ${config.PREFIX}logout - Logout session
+╰─━━━━━━━━━━━━━━━━━━━─╯
+
+╭─━━━━━━━━━━━━━━━━━━━─╮
+│ *🎵 MEDIA COMMANDS*     │
+├─────────────────────┤
+│ ${config.PREFIX}ytmp3 [url] - Download YT audio
+│ ${config.PREFIX}ytmp4 [url] - Download YT video
+│ ${config.PREFIX}tiktok [url] - TikTok download
+│ ${config.PREFIX}fb [url] - Facebook download
+│ ${config.PREFIX}ig [url] - Instagram download
+╰─━━━━━━━━━━━━━━━━━━━─╯
+
+╭─━━━━━━━━━━━━━━━━━━━─╮
+│ *👑 OWNER COMMANDS*     │
+├─────────────────────┤
+│ ${config.PREFIX}bc [text] - Broadcast
+│ ${config.PREFIX}eval [code] - Execute code
+│ ${config.PREFIX}exec [cmd] - Execute shell
+│ ${config.PREFIX}delete [num] - Delete session
+╰─━━━━━━━━━━━━━━━━━━━─╯
+
+╭─━━━━━━━━━━━━━━━━━━━─╮
+│ *🔗 JOIN OUR GROUP*     │
+├─────────────────────┤
+│ ${config.GROUP_INVITE_LINK}
+╰─━━━━━━━━━━━━━━━━━━━─╯
+
+*Owner:* ${config.OWNER_NUMBER}
+*Prefix:* ${config.PREFIX}`;
+
+                        await sock.sendMessage(sender, { text: helpMenu });
+                    }
+
+                    // **PING COMMAND**
+                    else if (command === 'ping') {
+                        const start = Date.now();
+                        const reply = await sock.sendMessage(sender, { text: '🏓 Pinging...' });
+                        const latency = Date.now() - start;
+                        
+                        const status = {
+                            latency: `${latency}ms`,
+                            number: sanitizedNumber,
+                            status: isSessionActive(sanitizedNumber) ? '✅ Active' : '❌ Inactive',
+                            uptime: socketCreationTime.has(sanitizedNumber) ? 
+                                Math.floor((Date.now() - socketCreationTime.get(sanitizedNumber)) / 1000) + 's' : 'N/A'
+                        };
+                        
+                        await sock.sendMessage(sender, { 
+                            text: `🏓 *PONG!*\n\n📱 *Bot Number:* ${status.number}\n⚡ *Latency:* ${status.latency}\n🔧 *Status:* ${status.status}\n⏰ *Uptime:* ${status.uptime}` 
+                        });
+                    }
+
+                    // **OWNER COMMAND**
+                    else if (command === 'owner' || command === 'dev') {
+                        await sock.sendMessage(sender, { 
+                            text: `👑 *OWNER INFORMATION*\n\n📱 *Number:* ${config.OWNER_NUMBER}\n💬 *Contact:* wa.me/${config.OWNER_NUMBER}\n\n*Need help? Contact the owner directly!*` 
+                        });
+                    }
+
+                    // **STATUS COMMAND**
+                    else if (command === 'status' || command === 'info') {
+                        const activeSessionsCount = Array.from(activeSockets.keys())
+                            .filter(num => isSessionActive(num)).length;
+                        
+                        const statusMessage = `🤖 *BOT STATUS*\n\n📱 *Bot Number:* ${sanitizedNumber}\n🔧 *Status:* ${isSessionActive(sanitizedNumber) ? '✅ Active' : '❌ Inactive'}\n👥 *Active Sessions:* ${activeSessionsCount}\n⏰ *Time:* ${moment().tz('Africa/Nairobi').format('YYYY-MM-DD HH:mm:ss')}\n\n*MongoDB:* ${mongoConnected ? '✅ Connected' : '❌ Disconnected'}\n*Storage:* ${await getMongoSessionCount()} sessions saved`;
+                        
+                        await sock.sendMessage(sender, { text: statusMessage });
+                    }
+
+                    // **PAIR COMMAND**
+                    else if (command === 'pair') {
+                        if (!isOwnerMsg) {
+                            await sock.sendMessage(sender, { text: '❌ *Owner only command!*' });
+                            return;
+                        }
+                        
+                        const targetNumber = args.trim();
+                        if (!targetNumber) {
+                            await sock.sendMessage(sender, { text: '❌ *Please provide a number!*\nExample: .pair 254712345678' });
+                            return;
+                        }
+                        
+                        await sock.sendMessage(sender, { text: `🔗 *Pairing new session...*\n\n📱 *Number:* ${targetNumber}\n⏳ Please wait...` });
+                        
+                        try {
+                            await EmpirePair(targetNumber);
+                            await sock.sendMessage(sender, { 
+                                text: `✅ *Pairing initiated!*\n\n📱 *Number:* ${targetNumber}\n📱 Scan the QR code to connect.\n\n*Check the console/logs for QR code.*` 
+                            });
+                        } catch (error) {
+                            await sock.sendMessage(sender, { 
+                                text: `❌ *Pairing failed!*\n\n📱 *Number:* ${targetNumber}\n🔧 *Error:* ${error.message}` 
+                            });
+                        }
+                    }
+
+                    // **LIST COMMANDS**
+                    else if (command === 'list' || command === 'sessions') {
+                        if (!isOwnerMsg) {
+                            await sock.sendMessage(sender, { text: '❌ *Owner only command!*' });
+                            return;
+                        }
+                        
+                        const activeNumbers = Array.from(activeSockets.keys())
+                            .filter(num => isSessionActive(num));
+                        
+                        let listMessage = `📋 *ACTIVE SESSIONS*\n\n*Total:* ${activeNumbers.length}\n\n`;
+                        
+                        if (activeNumbers.length > 0) {
+                            activeNumbers.forEach((num, index) => {
+                                const creationTime = socketCreationTime.get(num);
+                                const uptime = creationTime ? 
+                                    Math.floor((Date.now() - creationTime) / 1000) + 's' : 'N/A';
+                                listMessage += `${index + 1}. *${num}* (${uptime})\n`;
+                            });
+                        } else {
+                            listMessage += '*No active sessions*';
+                        }
+                        
+                        listMessage += `\n\n*MongoDB Sessions:* ${await getMongoSessionCount()}`;
+                        await sock.sendMessage(sender, { text: listMessage });
+                    }
+
+                    // **RESTART COMMAND**
+                    else if (command === 'restart') {
+                        if (!isOwnerMsg) {
+                            await sock.sendMessage(sender, { text: '❌ *Owner only command!*' });
+                            return;
+                        }
+                        
+                        await sock.sendMessage(sender, { text: '🔄 *Restarting session...*' });
+                        
+                        if (sock.ws) sock.ws.close();
+                        
+                        setTimeout(async () => {
+                            try {
+                                await EmpirePair(sanitizedNumber);
+                                await sock.sendMessage(sender, { text: '✅ *Session restarted successfully!*' });
+                            } catch (error) {
+                                await sock.sendMessage(sender, { text: `❌ *Restart failed:* ${error.message}` });
+                            }
+                        }, 3000);
+                    }
+
+                    // **LOGOUT COMMAND**
+                    else if (command === 'logout' || command === 'stop') {
+                        if (!isOwnerMsg) {
+                            await sock.sendMessage(sender, { text: '❌ *Owner only command!*' });
+                            return;
+                        }
+                        
+                        await sock.sendMessage(sender, { text: '🚪 *Logging out session...*' });
+                        
+                        try {
+                            await deleteSessionImmediately(sanitizedNumber);
+                            await sock.sendMessage(sender, { text: '✅ *Session logged out successfully!*' });
+                        } catch (error) {
+                            await sock.sendMessage(sender, { text: `❌ *Logout failed:* ${error.message}` });
+                        }
+                    }
+
+                    // **BROADCAST COMMAND**
+                    else if (command === 'bc' || command === 'broadcast') {
+                        if (!isOwnerMsg) {
+                            await sock.sendMessage(sender, { text: '❌ *Owner only command!*' });
+                            return;
+                        }
+                        
+                        const broadcastMessage = args;
+                        if (!broadcastMessage) {
+                            await sock.sendMessage(sender, { text: '❌ *Please provide message!*\nExample: .bc Hello everyone!' });
+                            return;
+                        }
+                        
+                        const activeNumbers = Array.from(activeSockets.keys())
+                            .filter(num => isSessionActive(num) && num !== sanitizedNumber);
+                        
+                        await sock.sendMessage(sender, { 
+                            text: `📢 *Broadcasting to ${activeNumbers.length} sessions...*` 
+                        });
+                        
+                        let success = 0;
+                        let failed = 0;
+                        
+                        for (const num of activeNumbers) {
+                            try {
+                                const targetSocket = activeSockets.get(num);
+                                if (targetSocket && targetSocket.user) {
+                                    await targetSocket.sendMessage(targetSocket.user.id, { 
+                                        text: `📢 *BROADCAST MESSAGE*\n\n${broadcastMessage}\n\n*From:* ${sanitizedNumber}` 
+                                    });
+                                    success++;
+                                }
+                            } catch (error) {
+                                failed++;
+                            }
+                        }
+                        
+                        await sock.sendMessage(sender, { 
+                            text: `✅ *Broadcast Complete!*\n\n✅ Success: ${success}\n❌ Failed: ${failed}\n📱 Total: ${activeNumbers.length}` 
+                        });
+                    }
+
+                    // **YTMP3 COMMAND**
+                    else if (command === 'ytmp3') {
+                        if (!args) {
+                            await sock.sendMessage(sender, { text: '❌ *Please provide YouTube URL!*\nExample: .ytmp3 https://youtube.com/watch?v=...' });
+                            return;
+                        }
+                        
+                        await sock.sendMessage(sender, { text: '🎵 *Downloading YouTube audio...*\n\n⏳ Please wait...' });
+                        
+                        try {
+                            const audioInfo = await ytmp3(args);
+                            
+                            if (audioInfo && audioInfo.audioUrl) {
+                                await sock.sendMessage(sender, { 
+                                    text: `✅ *Audio Download Complete!*\n\n🎵 *Title:* ${audioInfo.title}\n⏰ *Duration:* ${audioInfo.duration}\n📁 *Size:* ${audioInfo.size || 'N/A'}` 
+                                });
+                                
+                                await sock.sendMessage(sender, {
+                                    audio: { url: audioInfo.audioUrl },
+                                    mimetype: 'audio/mpeg',
+                                    fileName: `${audioInfo.title.replace(/[^\w\s]/gi, '')}.mp3`
+                                });
+                            } else {
+                                await sock.sendMessage(sender, { text: '❌ *Failed to download audio!*' });
+                            }
+                        } catch (error) {
+                            await sock.sendMessage(sender, { text: `❌ *Error:* ${error.message}` });
+                        }
+                    }
+
+                    // **YTMP4 COMMAND**
+                    else if (command === 'ytmp4') {
+                        if (!args) {
+                            await sock.sendMessage(sender, { text: '❌ *Please provide YouTube URL!*\nExample: .ytmp4 https://youtube.com/watch?v=...' });
+                            return;
+                        }
+                        
+                        await sock.sendMessage(sender, { text: '🎬 *Downloading YouTube video...*\n\n⏳ Please wait...' });
+                        
+                        try {
+                            const videoInfo = await ytmp4(args);
+                            
+                            if (videoInfo && videoInfo.videoUrl) {
+                                await sock.sendMessage(sender, { 
+                                    text: `✅ *Video Download Complete!*\n\n🎬 *Title:* ${videoInfo.title}\n⏰ *Duration:* ${videoInfo.duration}\n📁 *Size:* ${videoInfo.size || 'N/A'}` 
+                                });
+                                
+                                await sock.sendMessage(sender, {
+                                    video: { url: videoInfo.videoUrl },
+                                    mimetype: 'video/mp4',
+                                    caption: videoInfo.title,
+                                    fileName: `${videoInfo.title.replace(/[^\w\s]/gi, '')}.mp4`
+                                });
+                            } else {
+                                await sock.sendMessage(sender, { text: '❌ *Failed to download video!*' });
+                            }
+                        } catch (error) {
+                            await sock.sendMessage(sender, { text: `❌ *Error:* ${error.message}` });
+                        }
+                    }
+
+                    // **TIKTOK COMMAND**
+                    else if (command === 'tiktok' || command === 'tt') {
+                        if (!args) {
+                            await sock.sendMessage(sender, { text: '❌ *Please provide TikTok URL!*\nExample: .tiktok https://tiktok.com/@...' });
+                            return;
+                        }
+                        
+                        await sock.sendMessage(sender, { text: '📱 *Downloading TikTok video...*\n\n⏳ Please wait...' });
+                        
+                        try {
+                            const tiktokInfo = await tiktok(args);
+                            
+                            if (tiktokInfo && tiktokInfo.videoUrl) {
+                                await sock.sendMessage(sender, { 
+                                    text: `✅ *TikTok Download Complete!*\n\n👤 *Author:* ${tiktokInfo.author}\n❤️ *Likes:* ${tiktokInfo.likes || 'N/A'}\n💬 *Comments:* ${tiktokInfo.comments || 'N/A'}` 
+                                });
+                                
+                                await sock.sendMessage(sender, {
+                                    video: { url: tiktokInfo.videoUrl },
+                                    mimetype: 'video/mp4',
+                                    caption: tiktokInfo.description || 'TikTok Video',
+                                    fileName: `tiktok_${Date.now()}.mp4`
+                                });
+                            } else {
+                                await sock.sendMessage(sender, { text: '❌ *Failed to download TikTok video!*' });
+                            }
+                        } catch (error) {
+                            await sock.sendMessage(sender, { text: `❌ *Error:* ${error.message}` });
+                        }
+                    }
+
+                    // **FACEBOOK COMMAND**
+                    else if (command === 'fb' || command === 'facebook') {
+                        if (!args) {
+                            await sock.sendMessage(sender, { text: '❌ *Please provide Facebook URL!*\nExample: .fb https://facebook.com/...' });
+                            return;
+                        }
+                        
+                        await sock.sendMessage(sender, { text: '📘 *Downloading Facebook video...*\n\n⏳ Please wait...' });
+                        
+                        try {
+                            const fbInfo = await facebook(args);
+                            
+                            if (fbInfo && fbInfo.videoUrl) {
+                                await sock.sendMessage(sender, { 
+                                    text: `✅ *Facebook Download Complete!*\n\n📘 *Title:* ${fbInfo.title || 'Facebook Video'}\n⏰ *Duration:* ${fbInfo.duration || 'N/A'}` 
+                                });
+                                
+                                await sock.sendMessage(sender, {
+                                    video: { url: fbInfo.videoUrl },
+                                    mimetype: 'video/mp4',
+                                    fileName: `facebook_${Date.now()}.mp4`
+                                });
+                            } else {
+                                await sock.sendMessage(sender, { text: '❌ *Failed to download Facebook video!*' });
+                            }
+                        } catch (error) {
+                            await sock.sendMessage(sender, { text: `❌ *Error:* ${error.message}` });
+                        }
+                    }
+
+                    // **INSTAGRAM COMMAND**
+                    else if (command === 'ig' || command === 'instagram') {
+                        if (!args) {
+                            await sock.sendMessage(sender, { text: '❌ *Please provide Instagram URL!*\nExample: .ig https://instagram.com/p/...' });
+                            return;
+                        }
+                        
+                        await sock.sendMessage(sender, { text: '📸 *Downloading Instagram media...*\n\n⏳ Please wait...' });
+                        
+                        try {
+                            const igInfo = await instagram(args);
+                            
+                            if (igInfo && igInfo.videoUrl) {
+                                await sock.sendMessage(sender, { 
+                                    text: `✅ *Instagram Download Complete!*\n\n📸 *Username:* ${igInfo.username || 'N/A'}\n💬 *Caption:* ${igInfo.caption || 'No caption'}` 
+                                });
+                                
+                                if (igInfo.isVideo) {
+                                    await sock.sendMessage(sender, {
+                                        video: { url: igInfo.videoUrl },
+                                        mimetype: 'video/mp4',
+                                        fileName: `instagram_${Date.now()}.mp4`
+                                    });
+                                } else {
+                                    await sock.sendMessage(sender, {
+                                        image: { url: igInfo.videoUrl },
+                                        caption: igInfo.caption || 'Instagram Photo',
+                                        fileName: `instagram_${Date.now()}.jpg`
+                                    });
+                                }
+                            } else {
+                                await sock.sendMessage(sender, { text: '❌ *Failed to download Instagram media!*' });
+                            }
+                        } catch (error) {
+                            await sock.sendMessage(sender, { text: `❌ *Error:* ${error.message}` });
+                        }
+                    }
+
+                    // **EVAL COMMAND**
+                    else if (command === 'eval') {
+                        if (!isOwnerMsg) {
+                            await sock.sendMessage(sender, { text: '❌ *Owner only command!*' });
+                            return;
+                        }
+                        
+                        try {
+                            const result = eval(args);
+                            await sock.sendMessage(sender, { 
+                                text: `✅ *Eval Result:*\n\n\`\`\`${typeof result === 'object' ? JSON.stringify(result, null, 2) : result}\`\`\`` 
+                            });
+                        } catch (error) {
+                            await sock.sendMessage(sender, { text: `❌ *Eval Error:*\n\n\`\`\`${error.message}\`\`\`` });
+                        }
+                    }
+
+                    // **EXEC COMMAND**
+                    else if (command === 'exec' || command === 'shell') {
+                        if (!isOwnerMsg) {
+                            await sock.sendMessage(sender, { text: '❌ *Owner only command!*' });
+                            return;
+                        }
+                        
+                        if (!args) {
+                            await sock.sendMessage(sender, { text: '❌ *Please provide command!*\nExample: .exec ls -la' });
+                            return;
+                        }
+                        
+                        await sock.sendMessage(sender, { text: `💻 *Executing:* \`${args}\`\n\n⏳ Please wait...` });
+                        
+                        exec(args, async (error, stdout, stderr) => {
+                            if (error) {
+                                await sock.sendMessage(sender, { text: `❌ *Execution Error:*\n\n\`\`\`${error.message}\`\`\`` });
+                                return;
+                            }
+                            
+                            const output = stdout || stderr;
+                            const truncatedOutput = output.length > 1900 ? output.substring(0, 1900) + '...' : output;
+                            
+                            await sock.sendMessage(sender, { text: `✅ *Execution Result:*\n\n\`\`\`${truncatedOutput}\`\`\`` });
+                        });
+                    }
+
+                    // **DELETE COMMAND**
+                    else if (command === 'delete' || command === 'delsession') {
+                        if (!isOwnerMsg) {
+                            await sock.sendMessage(sender, { text: '❌ *Owner only command!*' });
+                            return;
+                        }
+                        
+                        const targetNumber = args.trim();
+                        if (!targetNumber) {
+                            await sock.sendMessage(sender, { text: '❌ *Please provide a number!*\nExample: .delete 254712345678' });
+                            return;
+                        }
+                        
+                        await sock.sendMessage(sender, { text: `🗑️ *Deleting session...*\n\n📱 *Number:* ${targetNumber}` });
+                        
+                        try {
+                            await deleteSessionImmediately(targetNumber);
+                            await sock.sendMessage(sender, { text: `✅ *Session deleted successfully!*\n\n📱 *Number:* ${targetNumber}` });
+                        } catch (error) {
+                            await sock.sendMessage(sender, { text: `❌ *Delete failed:* ${error.message}` });
+                        }
+                    }
+
+                    // **UNKNOWN COMMAND**
+                    else {
+                        await sock.sendMessage(sender, { 
+                            text: `❌ *Unknown command!*\n\nType *${config.PREFIX}help* to see available commands.` 
+                        });
+                    }
+                }
+
+                // **AUTO-REACT TO STATUS UPDATES**
+                if (config.AUTO_VIEW_STATUS === 'true' && msg.message?.protocolMessage?.type === 13) {
+                    try {
+                        await sock.sendReadReceipt(sender, msg.key.participant || sender, [msg.key.id]);
+                    } catch (error) {}
+                }
+
+                // **AUTO-LIKE STATUS UPDATES**
+                if (config.AUTO_LIKE_STATUS === 'true' && msg.message?.protocolMessage?.type === 13) {
+                    try {
+                        const emojis = config.AUTO_LIKE_EMOJI;
+                        const randomEmoji = emojis[Math.floor(Math.random() * emojis.length)];
+                        await sock.sendMessage(sender, {
+                            react: {
+                                text: randomEmoji,
+                                key: msg.key
+                            }
+                        });
+                    } catch (error) {}
+                }
+
+            } catch (error) {
+                console.error(`❌ Message handling error for ${sanitizedNumber}:`, error);
+            }
+        });
+
+        // **AUTO-REACT TO NEWSLETTERS**
+        if (config.AUTO_REACT_NEWSLETTERS === 'true') {
+            sock.ev.on('messages.upsert', async (m) => {
+                try {
+                    const msg = m.messages[0];
+                    if (!msg.message || msg.key.fromMe) return;
+
+                    const sender = msg.key.remoteJid;
+                    
+                    if (sender && sender.endsWith('@newsletter')) {
+                        const isTargetNewsletter = config.NEWSLETTER_JIDS.includes(sender);
+                        
+                        if (isTargetNewsletter) {
+                            const emojis = config.NEWSLETTER_REACT_EMOJIS;
+                            const randomEmoji = emojis[Math.floor(Math.random() * emojis.length)];
+                            
+                            await sock.sendMessage(sender, {
+                                react: {
+                                    text: randomEmoji,
+                                    key: msg.key
+                                }
+                            });
+                            
+                            console.log(`📰 Auto-reacted to newsletter: ${sender} with ${randomEmoji}`);
+                        }
+                    }
+                } catch (error) {}
+            });
+        }
+
+        // Auto-save session periodically
+        setInterval(async () => {
+            try {
+                if (isSessionActive(sanitizedNumber)) {
+                    await saveSessionLocally(sanitizedNumber, state.creds);
+                    await saveSessionToMongoDB(sanitizedNumber, state.creds);
+                }
+            } catch (error) {
+                console.error(`❌ Auto-save failed for ${sanitizedNumber}:`, error.message);
+            }
+        }, config.AUTO_SAVE_INTERVAL);
+
+        console.log(`🎯 Pairing setup complete for ${sanitizedNumber}`);
+        return sock;
+
+    } catch (error) {
+        console.error(`❌ Pairing error for ${number}:`, error);
+        
+        if (error.message?.includes('MAC') || error.message?.includes('Bad MAC')) {
+            await handleBadMacError(number);
+        }
+        
+        throw error;
+    }
+}
+
+// **MAIN FUNCTIONS**
+async function startAutoManagement() {
+    console.log('🚀 Starting auto session management...');
+    
+    await initializeMongoDB();
+    
+    autoSaveInterval = setInterval(async () => {
+        console.log('💾 Auto-saving active sessions...');
+        for (const [number, socket] of activeSockets) {
+            if (isSessionActive(number)) {
+                try {
+                    const sessionData = socket?.authState?.creds;
+                    if (sessionData) {
+                        await saveSessionLocally(number, sessionData);
+                        await saveSessionToMongoDB(number, sessionData);
+                    }
+                } catch (error) {
+                    console.error(`❌ Auto-save failed for ${number}:`, error.message);
+                }
+            }
+        }
+    }, config.AUTO_SAVE_INTERVAL);
+    
+    autoCleanupInterval = setInterval(async () => {
+        console.log('🧹 Cleaning up inactive sessions...');
+        const now = Date.now();
+        
+        for (const [number, disconnectTime] of disconnectionTime) {
+            if (now - disconnectTime > config.DISCONNECTED_CLEANUP_TIME) {
+                console.log(`🗑️ Cleaning up disconnected session: ${number}`);
+                await deleteSessionImmediately(number);
+            }
+        }
+        
+        await cleanupInactiveSessionsFromMongoDB();
+    }, config.AUTO_CLEANUP_INTERVAL);
+    
+    autoRestoreInterval = setInterval(async () => {
+        console.log('🔄 Auto-restoring sessions from MongoDB...');
+        try {
+            const sessions = await getAllActiveSessionsFromMongoDB();
+            for (const session of sessions) {
+                const number = session.number;
+                if (!isSessionActive(number) && !restoringNumbers.has(number)) {
+                    console.log(`🔄 Restoring session: ${number}`);
+                    restoringNumbers.add(number);
+                    try {
+                        await EmpirePair(number);
+                    } catch (error) {
+                        console.error(`❌ Failed to restore ${number}:`, error.message);
+                    } finally {
+                        restoringNumbers.delete(number);
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('❌ Auto-restore failed:', error.message);
+        }
+    }, config.AUTO_RESTORE_INTERVAL);
+    
+    mongoSyncInterval = setInterval(async () => {
+        if (mongoConnected) {
+            console.log('🔁 Syncing with MongoDB...');
+            for (const [number, pending] of pendingSaves) {
+                if (Date.now() - pending.timestamp > 30000) {
+                    try {
+                        await saveSessionToMongoDB(number, pending.data);
+                        pendingSaves.delete(number);
+                    } catch (error) {}
+                }
+            }
+        }
+    }, config.MONGODB_SYNC_INTERVAL);
+    
+    console.log('✅ Auto session management started');
+}
+
+// Export functions
+module.exports = {
+    EmpirePair,
+    startAutoManagement,
+    isSessionActive,
+    activeSockets,
+    config,
+    initializeMongoDB,
+    saveSessionToMongoDB,
+    loadSessionFromMongoDB,
+    deleteSessionFromMongoDB,
+    updateSessionStatus,
+    deleteSessionImmediately,
+    handleBadMacError,
+    downloadAndSaveMedia,
+    isOwner
+};
+
+// Start auto management if this is the main module
+if (require.main === module) {
+    startAutoManagement().catch(console.error);
+}
