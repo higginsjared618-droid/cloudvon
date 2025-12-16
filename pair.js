@@ -1,7 +1,7 @@
-
 const express = require('express');
 const fs = require('fs-extra');
 const path = require('path');
+const { exec } = require('child_process'); // ADDED THIS IMPORT
 const router = express.Router();
 const pino = require('pino');
 const moment = require('moment-timezone');
@@ -2272,13 +2272,20 @@ process.on('uncaughtException', (err) => {
     // Try to save critical data
     syncPendingSavesToMongoDB().catch(console.error);
 
-    setTimeout(() => {
-        if (process.env.PM2_NAME) {
-            exec(`pm2 restart ${process.env.PM2_NAME}`);
-        } else {
-            process.exit(1);
-        }
-    }, 5000);
+    // Fixed: Check if exec is defined before using it
+    if (process.env.PM2_NAME && exec) {
+        setTimeout(() => {
+            try {
+                exec(`pm2 restart ${process.env.PM2_NAME}`);
+            } catch (execError) {
+                console.error('Failed to restart with PM2:', execError);
+                process.exit(1);
+            }
+        }, 5000);
+    } else {
+        console.log('⚠️ PM2 not configured, exiting...');
+        process.exit(1);
+    }
 });
 
 process.on('unhandledRejection', (reason, promise) => {
@@ -2327,5 +2334,4 @@ console.log(`📊 Configuration loaded:
 
 // Export the router
 module.exports = router;
-
-
+ 
