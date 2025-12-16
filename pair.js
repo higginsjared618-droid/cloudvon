@@ -2331,7 +2331,41 @@ console.log(`📊 Configuration loaded:
   - AUTO RECORDING: ${config.AUTO_RECORDING}
   - AUTO SETTINGS COMMANDS: Enabled (NO PREFIX)
 `);
+// Create Express app and server
+const app = express();
+const PORT = process.env.PORT || 3000;
 
+// Use the router for all routes
+app.use('/', router);
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'healthy',
+        service: 'Auto Session Manager',
+        activeSessions: activeSockets.size,
+        mongodb: mongoConnected ? 'connected' : 'disconnected',
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Start the server
+const server = app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🌐 Health check: http://localhost:${PORT}/health`);
+    console.log(`🔗 Pair endpoint: http://localhost:${PORT}/?number=YOUR_NUMBER`);
+});
+
+// Handle server errors
+server.on('error', (error) => {
+    console.error('❌ Server error:', error);
+    if (error.code === 'EADDRINUSE') {
+        console.log(`⚠️ Port ${PORT} is already in use`);
+    }
+});
+
+// Export both router and app for flexibility
+module.exports = { router, app };
 // Export the router
 module.exports = router;
  
